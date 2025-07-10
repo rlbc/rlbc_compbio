@@ -1,0 +1,254 @@
+###############################################################################
+# Snakefile – pipeline CUT&RUN (CSV, IP x IgG, downsample + MACS2)            #
+###############################################################################
+
+import csv, re
+configfile: "config.yaml"
+
+RESULTS = config["results_dir"]             # pasta base de resultados
+peak_cfg = config["macs2"][config["peak_type"]]
+EXT      = peak_cfg["ext"]
+
+###############################################################################
+# 1. Metadata (read from **CSV**)                                             #
+###############################################################################
+META = {}              # sample → {condition,type,replicate,bam}
+IP   = {}              # condition → [IPs]
+IGG  = {}              # condition → [IgGs]
+# Map IgG by condition and replicate, to avoid mixing R1×R2
+IGG_MATCH = {}         # condition → {replicate: igg_sample}
+
+with open(config["samples_csv"]) as fh:
+    for row in csv.DictReader(fh):
+        s     = row["sample"]
+        cond  = row["condition"]
+        typ   = row["type"]           # "IP" ou "IgG"
+        rep   = row["replicate"]      # "1", "2", …
+        META[s] = {"condition": cond, "type": typ, "rep": rep, "bam": row["bam"]}
+        (IP if typ == "IP" else IGG).setdefault(cond, []).append(s)
+        if typ == "IgG":
+            IGG_MATCH.setdefault(cond, {})[rep] = s
+
+ALL_IP     = [s for s,i in META.items() if i["type"] == "IP"]
+CONDITIONS = sorted(IP)
+# Names for merged BAMs: results/merged/{condition}_{ttype}.bam
+MERGED_IP  = [ f"{cond}_IP"  for cond in CONDITIONS ]
+MERGED_IGG = [ f"{cond}_IgG" for cond in CONDITIONS ]
+
+###############################################################################
+# 2. Global target (peaks from each replicate + pooled)                       #
+###############################################################################
+rule all:
+    input:
+        expand(RESULTS + "/peaks/{sample}_peaks." + EXT, 
+               sample=[s for s in META if META[s]["type"] == "IP"]),
+        expand(RESULTS + "/peaks/{condition}_pooled_peaks." + EXT,
+               condition=CONDITIONS),  # pooled peaks
+        # BAMs merged + index
+        expand(RESULTS + "/merged/{condition}_{ttype}.bam",
+               condition=CONDITIONS, ttype=["IP","IgG"]),
+        expand(RESULTS + "/merged/{condition}_{ttype}.bam.bai",
+               condition=CONDITIONS, ttype=["IP","IgG"]),
+        # bigwigs RAW and RPGC from downsampled
+        expand(RESULTS + "/bigwig/{name}.{norm}.bw",
+               name=ALL_IP + sum(IGG.values(), []),   # all downsampled samples
+               norm=["original","RPGC"]),
+        # bigwigs RAW and RPGC from merged
+        expand(RESULTS + "/bigwig/{name}.{norm}.bw",
+               name=MERGED_IP + MERGED_IGG,
+               norm=["original","RPGC"])
+
+###############################################################################
+# 3. Flagstat from original BAMs                                              #
+###############################################################################
+rule flagstat:
+    input:
+        lambda wc: META[wc.sample]["bam"]
+    output:
+        RESULTS + "/flagstats/{sample}.txt"
+    log:
+        RESULTS + "/logs/flagstat_{sample}.log"
+    benchmark:
+        RESULTS + "/benchmarks/flagstat_{sample}.txt"
+    conda: config["envs"]["samtools"]
+    shell:
+        "samtools flagstat {input} > {output} 2> {log}"
+
+###############################################################################
+# 4. Minimum reads separated for IP and IgG (by condition)                    #
+###############################################################################
+rule min_count:
+    input:
+        lambda wc: [RESULTS + f"/flagstats/{s}.txt" for s in (ALL_IP if wc.ttype == "IP" else [s for sub in IGG.values() for s in sub])]
+    output:
+        RESULTS + "/flagstats/{ttype}_min.txt"
+    wildcard_constraints:
+        ttype="IP|IgG"
+    run:
+        reads = []
+        for f in input:
+            first = open(f).readline()
+            reads.append(int(re.match(r"(\d+)\s+\+", first).group(1)))
+        open(output[0], "w").write(str(min(reads)))
+
+###############################################################################
+# 5. Downsample BAMs to the lowest number in their group                      #
+###############################################################################
+rule downsample:
+    input:
+        bam       = lambda wc: META[wc.sample]["bam"],
+        min_count = lambda wc: RESULTS + "/flagstats/" + META[wc.sample]["type"] + "_min.txt"
+    output:
+        RESULTS + "/downsampled/{sample}.bam"
+    log:
+        RESULTS + "/logs/downsample_{sample}.log"
+    benchmark:
+        RESULTS + "/benchmarks/downsample_{sample}.txt"
+    conda: config["envs"]["downsample"]
+    params:
+        target = (lambda wc:
+                  int(open(
+                      RESULTS + "/flagstats/" +
+                      META[wc.sample]["type"] + "_min.txt"
+                  ).read().strip()))
+    shell:
+        (
+            "reformat.sh in={input.bam} out={output} "
+            "samplereadstarget={params.target} > {log} 2>&1"
+        )
+
+###############################################################################
+# 6. Indexing BAMs                                                            #
+###############################################################################
+rule index_bam:
+    input:
+        RESULTS + "/downsampled/{sample}.bam"
+    output:
+        RESULTS + "/downsampled/{sample}.bam.bai"
+    log:
+        RESULTS + "/logs/index_{sample}.log"
+    benchmark:
+        RESULTS + "/benchmarks/index_{sample}.txt"
+    conda: config["envs"]["samtools"]
+    shell:
+        "samtools index {input} {output} > {log} 2>&1"
+
+###############################################################################
+# 7. Peak‑calling by replicate (IP vs IgG)                                    #
+###############################################################################
+rule peaks_rep:
+    input:
+        ip   = lambda wc: RESULTS + "/downsampled/{sample}.bam" if META[wc.sample]["type"] == "IP" else None,
+        ctrl = lambda wc: RESULTS + "/downsampled/" + (
+            IGG_MATCH.get(META[wc.sample]["condition"], {})
+             .get(META[wc.sample]["rep"],
+                  IGG[META[wc.sample]["condition"]][0])
+            ) + ".bam"
+    output:
+        RESULTS + "/peaks/{sample}_peaks." + EXT
+    log:
+        RESULTS + "/logs/macs2_{sample}.log"
+    benchmark:
+        RESULTS + "/benchmarks/macs2_{sample}.txt"
+    conda: config["envs"]["macs2"]
+    params:
+        extra  = peak_cfg["extra"],
+        genome = config["macs2"]["genome_size"],
+        pval   = config["macs2"]["pvalue"]
+    shell:
+        (
+            "macs2 callpeak -t {input.ip} -c {input.ctrl} "
+            "-g {params.genome} -p {params.pval} "
+            "-n {wildcards.sample} --outdir " + RESULTS + "/peaks "
+            "{params.extra} > {log} 2>&1"
+        )
+
+###############################################################################
+# 8. Peak‑calling pooled (all IP vs all IgG)                                  #
+###############################################################################
+rule peaks_pooled:
+    input:
+        ips   = lambda wc: [ RESULTS + "/downsampled/" + s + ".bam" for s in IP[wc.condition] ],
+        ctrls = lambda wc: [ RESULTS + "/downsampled/" + s + ".bam" for s in IGG[wc.condition] ]
+    output:
+        RESULTS + "/peaks/{condition}_pooled_peaks." + EXT
+    log:
+        RESULTS + "/logs/macs2_{condition}_pooled.log"
+    benchmark:
+        RESULTS + "/benchmarks/macs2_{condition}_pooled.txt"
+    conda: config["envs"]["macs2"]
+    params:
+        extra  = peak_cfg["extra"],
+        genome = config["macs2"]["genome_size"],
+        pval   = config["macs2"]["pvalue"]
+    shell:
+        (
+            "macs2 callpeak -t {input.ips} -c {input.ctrls} "
+            "-g {params.genome} -p {params.pval} "
+            "-n {wildcards.condition}_pooled --outdir " + RESULTS + "/peaks "
+            "{params.extra} > {log} 2>&1"
+        )
+
+###############################################################################
+# 9. Merged replicates from each condition (IP and IgG)                       #
+###############################################################################
+rule merge_bams:
+    input:
+        lambda wc: [ RESULTS + "/downsampled/" + s + ".bam"
+                     for s in (IP if wc.ttype == "IP" else IGG)[wc.condition] ]
+    output:
+        RESULTS + "/merged/{condition}_{ttype}.bam"
+    log:
+        RESULTS + "/logs/merge_{condition}_{ttype}.log"
+    benchmark:
+        RESULTS + "/benchmarks/merge_{condition}_{ttype}.txt"
+    conda: config["envs"]["samtools"]
+    shell:
+        "samtools merge -f {output} {input} 2> {log}"
+
+
+rule index_merged:
+    input:
+        RESULTS + "/merged/{condition}_{ttype}.bam"
+    output:
+        RESULTS + "/merged/{condition}_{ttype}.bam.bai"
+    log:
+        RESULTS + "/logs/index_merged_{condition}_{ttype}.log"
+    benchmark:
+        RESULTS + "/benchmarks/index_merged_{condition}_{ttype}.txt"
+    conda: config["envs"]["samtools"]
+    shell:
+        "samtools index {input} {output} > {log} 2>&1"
+
+###############################################################################
+# 10. bigWig RAW and RPGC via deepTools
+###############################################################################
+rule bam_to_bw:
+    input:
+        bam = (lambda wc:
+               RESULTS + ("/downsampled/" if "_IP" not in wc.name and "_IgG" not in wc.name
+                          else "/merged/") + wc.name + ".bam"),
+        bai = (lambda wc:
+               RESULTS + ("/downsampled/" if "_IP" not in wc.name and "_IgG" not in wc.name
+                          else "/merged/") + wc.name + ".bam.bai")
+    output:
+        bw  = RESULTS + "/bigwig/{name}.{norm}.bw"
+    log:
+        RESULTS + "/logs/bigwig_{name}.{norm}.log"
+    benchmark:
+        RESULTS + "/benchmarks/bigwig_{name}.{norm}.txt"
+    conda: config["envs"]["deeptools"]
+    params:
+        bins   = config["bigwig"]["bin_size"],
+        effg   = config["bigwig"]["eff_genome"],
+        extra  = lambda wc: "" if wc.norm == "original"
+                           else "--normalizeUsing RPGC --effectiveGenomeSize " +
+                                str(config["bigwig"]["eff_genome"])
+    shell:
+        (
+          "bamCoverage --bam {input.bam} "
+          "--outFileName {output.bw} "
+          "--binSize {params.bins} "
+          "{params.extra} "
+          "> {log} 2>&1"
+        )

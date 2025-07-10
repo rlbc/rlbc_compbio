@@ -1,0 +1,31 @@
+# config.yaml
+# Results directory for downsampled Cut&Run data
+results_dir: results_downsample
+
+# Metadata CSV file (columns: condition,type,replicate,sample,bam)
+samples_csv: samples.csv
+
+# MACS2 parameters
+macs2:
+  genome_size: 2.7e9
+  pvalue: 1.0E-5
+  narrow:
+    extra: "--nolambda --nomodel --extsize 150 --keep-dup all -f BAMPE"
+    ext: narrowPeak
+  broad:
+    extra: "--broad --broad-cutoff 1.0E-5 -f BAM"
+    ext: broadPeak
+
+# narrow or broad
+peak_type: broad
+
+bigwig:
+  bin_size: 50                       # resolution in bp
+  eff_genome: 2864785220             # used in RPGC (hg19)
+
+# Conda environments
+envs:
+  downsample: "envs/bbmap.yaml"
+  samtools:   "envs/samtools.yaml"
+  macs2:      "envs/macs2.yaml"
+  deeptools:  "envs/deeptools.yaml"
