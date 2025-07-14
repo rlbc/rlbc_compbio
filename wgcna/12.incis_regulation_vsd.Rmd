@@ -1,0 +1,195 @@
+---
+title: "inCis Regulation for publication"
+author: "Rafael L. B. Coan"
+date: "06/12/2021"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/home/rstudio/")
+```
+
+# Introduction
+
+This notebook performs in-Cis regulation of lncRNA and HDACs on Ewing sarcoma.
+
+```{r libraries, results='hide'}
+library("dplyr")
+library("tidyr")
+library("ggplot2")
+library("DESeq2")
+library("biomaRt")
+library("GenomicFeatures")
+library("Gviz")
+
+#-----My package-----#
+library("devtools")
+#load_all("rc05hdac/")
+```
+
+# Methods
+
+## Import annotation
+
+```{r import}
+gfffile <- rtracklayer::import.gff("/home/rstudio/gencode.v30.annotation.gtf")
+GRSapeins <- as(gfffile, "GRanges")
+```
+
+## Tests
+
+```{r test, eval=FALSE, include=FALSE}
+subset(GRSapeins, gene_id == "ENSG00000116478.12" & type == "gene", select = c(gene_id, gene_type, type))
+subset(GRSapeins, gene_id == "ENSG00000116478.12" & type == "gene", select = c(gene_id, gene_type, type)) + 1000
+rtracklayer::export.gff(subset(GRSapeins, gene_id == "ENSG00000116478.12" & type == "gene", select = c(gene_id, gene_type, type)) + 1000, "temp2.gtf")
+subset(GRSapeins, gene_id == c("ENSG00000116478.12", "ENSG00000196591.12") & type == "gene", select = c(gene_id, gene_type, type))
+
+rtracklayer::export.gff(subsetByOverlaps(GRSapeins, unstrand(hdac1 + 100000)), "temp5.gtf")
+```
+
+## Select intervals
+
+Overlaps HDAC intervals + window size with gencode .30 genome to extract lncRNA features present on the interval. Returns the positional relation of HDAC - lncRNA.
+
+```{r intervals}
+hdacs = c("ENSG00000116478.12", "ENSG00000196591.12", "ENSG00000171720.10", "ENSG00000068024.16", "ENSG00000108840.15", "ENSG00000094631.19", "ENSG00000061273.18", "ENSG00000147099.21", "ENSG00000048052.21", "ENSG00000100429.18", "ENSG00000163517.15")
+
+# Taken from gencode.v30.long_noncoding_RNAs.gtf
+lncIds = c("3prime_overlapping_ncRNA", "TEC", "antisense", "bidirectional_promoter_lncRNA", "lincRNA", "macro_lncRNA", "non_coding", "processed_transcript", "sense_intronic", "sense_overlapping")
+
+# 10kb, 50kb and 100kb windows
+# corWindow <- c(10000, 50000, 100000)
+
+res <- data.frame()
+for (item in hdacs) {
+  hdacPos <- subset(GRSapeins, gene_id == item & type == "gene", select = c(gene_id, gene_type, type))
+  hdacPos <- unstrand(hdacPos)
+  resSubset <- subsetByOverlaps(GRSapeins, hdacPos + 100000)
+  res <- rbind(res, as.data.frame(mcols(resSubset)) %>% 
+    filter(gene_type %in% lncIds & type == "gene") %>% 
+    dplyr::select(gene_id, gene_type, gene_name) %>% 
+    mutate(hdac = item))
+}
+
+# Print table
+res
+```
+
+## Check annotation
+
+Now I'm going to check if these annotations are correct with previous file (vsdAnnot_11.brohl_normalization.csv).
+
+```{r check}
+expEwing <- read.csv("vsdAnnot_11.brohl_normalization.csv", row.names = 1)
+
+# Separates only lncRNA with expression
+# lncRNA present on expEwing and annotation == "lncRNA"
+resClean <- data.frame()
+for (item in res$gene_id) {
+  itemNV <- sub('\\.[0-9]*$', '', item)
+  if (!is.na(expEwing[itemNV,]$gene_biotype) & expEwing[itemNV,]$gene_biotype == "lncRNA") {
+    resClean <- rbind(resClean, res %>% filter(gene_id == item))
+  }
+  else {
+    print("lncRNA not present on expression table:")
+    print(itemNV)
+  }
+}
+
+# Print clean table
+resClean
+```
+
+## Calculates correlation
+
+Computes correlation between HDACs and lncRNA. Plots are generated in locus and a lm fit is calculated and ploted.
+
+```{r correlation, figures-side, fig.show="hold", out.width="50%"}
+outCor <- data.frame()
+
+#png(filename="plot.png", res=300, width = 1000, height = 1000)
+#par(mar = c(4,4,.1,.1), mfrow = c(round(nrow(resClean)/2), 2))
+
+for (i in 1:nrow(resClean)) {
+  # Calculate correlation
+  lnc <- sub('\\.[0-9]*$', '', resClean[i,1])
+  ptn <- sub('\\.[0-9]*$', '', resClean[i,4])
+  c <- cor.test(as.numeric(expEwing[ptn,1:26]), as.numeric(expEwing[lnc,1:26]), method = "pearson")
+  outCor <- rbind(outCor, c(ptn, lnc, resClean[i,1], c$estimate, c$p.value))
+  
+  # Plot values
+  model <- lm(as.numeric(expEwing[lnc,1:26]) ~ as.numeric(expEwing[ptn,1:26]))
+  plot(as.numeric(expEwing[ptn,1:26]), as.numeric(expEwing[lnc,1:26]), xlab = paste0(expEwing[ptn,]$hgnc_symbol), ylab = resClean[i,]$gene_name)
+  abline(model)
+  legend("topleft",legend=paste("R2 is", format(summary(model)$r.squared,digits=3)))
+}
+
+colnames(outCor) <- c("protein", "lncrna", "gene_id", "estimate", "pvalue")
+```
+
+# Results
+
+## Location of lncRNA
+
+There are `r dim(res)[1]` lncRNA found near 100,000 bp from HDACs. After cheking if they have expression on *vsdAnnot_11.brohl_normalization.csv*, we where left with `r dim(resClean)[1]` lncRNA. They are:
+
+```{r}
+resClean
+```
+
+## Correlation of lncRNA-HDAC
+
+Correlation plots are above. The distribution of correlation of estimation values and p-values:
+
+```{r plot correlation}
+ggplot(outCor, aes(x=lncrna ,y=as.numeric(estimate), color=as.numeric(pvalue), shape=as.numeric(pvalue) <= 0.05)) + 
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") + 
+  labs(title = "Pearson correlation", x = "lncRNA", y = "Estimates", color = "p-value", shape = "p-value <= 0.05") +
+  scale_color_viridis_c() +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=rel(0.9)))
+```
+
+Values with p <= 0.05:
+
+```{r selection}
+temp <- merge(outCor["gene_id"], resClean[c("gene_id", "gene_name")], by="gene_id")
+row.names(temp) <- temp$gene_id
+outCor %>% filter(pvalue <= 0.05) %>% mutate(hdac_name = expEwing[protein,]$hgnc_symbol, lnc_name = temp[gene_id,]$gene_name)
+```
+
+Full table:
+
+```{r}
+outCor
+```
+
+```{r test2}
+atrack <- AnnotationTrack(resSubset)
+gtrack <- GenomeAxisTrack()
+
+#gen <- genome(resSubset)
+gen <- "hg38"
+chr <- as.character(unique(seqnames(resSubset)))
+itrack <- IdeogramTrack(genome = gen, chromosome = chr)
+
+#temp <- subset(resSubset, type == "gene", select = c(gene_id, gene_type, gene_name))
+
+grtrack <- GeneRegionTrack(resSubset, collapseTranscripts = "meta", genome = gen, chromosome = chr, name = "Gene Model")
+
+plotTracks(list(itrack, gtrack, grtrack))
+```
+
+# SessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```
+

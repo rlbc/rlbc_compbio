@@ -1,0 +1,245 @@
+---
+title: "igraph PPI publication"
+author: "Rafael L. B. Coan"
+date: "26/12/2021"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/home/rstudio/")
+```
+
+# Introduction
+
+## Libraries
+
+```{r libraries}
+library("dplyr")
+library("igraph")
+library("gprofiler2")
+```
+
+# Methods
+
+## Load data
+
+```{r load data}
+# Load network
+if (!exists("modTOM")) {
+ load("modTOM_step.RData")
+}
+
+# Load PPI from IID
+dataFirst <- read.csv(file = "PPIs_1st.txt", header = TRUE)
+```
+
+Old removed code:
+
+> netFirstH2 <- induced_subgraph(wnet, vids = unlist(neighborhood(netFirst, order = 1, nodes = V(netFirst)["HDAC2"])), impl = "copy_and_delete")
+write_graph(netFirstH2, file = "netfirsth2.graphml", format = "graphml")
+
+## Create network
+
+```{r network}
+########## Create co-expression network ##########
+net0 <- igraph::graph.adjacency(modTOM, weighted = TRUE, mode = "undirected")
+
+# Remove self loops
+net0 <- simplify(net0)
+
+########## Create PPI network ##########
+
+# Create network from 1st interactions
+netFirst <- graph_from_data_frame(dataFirst[3:15])
+
+# Get all lncRNA ids
+allLnc <-
+  probes1 %>% 
+  filter(gene_type != "protein_coding") %>% 
+  select(gene_name) %>% 
+  unlist() %>% 
+  unname()
+
+# Get all EWS-FLI1 1st interactor ids
+netFirstNodes <- names(V(netFirst))
+
+# Index of net0 nodes to keep
+i <- names(V(net0)) %in% c(netFirstNodes, allLnc)
+
+# Subnetwork from net0 (all co-expression)
+# Get a subnetwork with nodes from netFirst and allLnc
+# Nodes are in PPI plus all lncRNA
+netWgcnaPpiFirst0 <- induced_subgraph(net0, vids = i, impl = "copy_and_delete")
+
+# Summary of netWgcnaPpiFirst weights
+print("netWgcnaPpiFirst0 weight summary info")
+print(summary(E(netWgcnaPpiFirst0)$weight))
+
+# Compare to the original net0
+print("net0 weight summary info")
+print(summary(E(net0)$weight))
+
+# Only get connections above 90%
+quantileValue = 0.90
+i <- E(netWgcnaPpiFirst0)$weight > unname(quantile(E(netWgcnaPpiFirst0)$weight, quantileValue))
+
+# Create a smaller subnetwork based on cutoff
+netWgcnaPpiFirst <- subgraph.edges(netWgcnaPpiFirst0, E(netWgcnaPpiFirst0)[i], delete.vertices = TRUE)
+
+########## Annotate network ##########
+
+tempAnnot <- probes1 %>% filter(gene_name %in% names(V(netWgcnaPpiFirst)))
+
+# Find duplicated itens
+tempAnnot$gene_name[duplicated(tempAnnot$gene_name)]
+# Check wich gene_id to keep
+geneInfo %>% filter(gene_name == c("GOLGA8M", "HSPA14"))
+# We should keep ENSG00000187522 and ENSG00000188626
+tempAnnot <- subset(tempAnnot, gene_id != "ENSG00000187522" & gene_id != "ENSG00000188626")
+
+# Match nodes order
+tempAnnot <- arrange(tempAnnot, match(gene_name, names(V(netWgcnaPpiFirst))))
+
+# Add node attributes to the network
+V(netWgcnaPpiFirst)$gene_id <- tempAnnot$gene_id
+V(netWgcnaPpiFirst)$gene_type <- tempAnnot$gene_type
+
+# Save network for inspection
+#write_graph(netWgcnaPpiFirst, file = "netWgcnaPpiFirst.graphml", format = "graphml")
+```
+
+There are duplicated items because some gene have the same name for lncRNA and their protein coding version. Here are only two. We can check their modules and keep only the right ones. Alternatively, we could work with ensembl ids from the start. 
+
+# Results
+
+## GO
+
+GO of co-expression module "darkmagenta" after we filter PPI items. Used a custom annotation for gProfiler.
+
+```{r upload gmt, eval=FALSE}
+# Already uploaded the first time
+upload_GMT_file(gmtfile = "cancer_hdac_genesets.zip")
+```
+
+> Your custom annotations ID is gp__ZEow_oHws_ILU
+You can use this ID as an 'organism' name in all the related enrichment tests against this custom source.
+Just use: gost(my_genes, organism = 'gp__ZEow_oHws_ILU')
+[1] "gp__ZEow_oHws_ILU"
+
+```{r gprofiler netWgcnaPpiFirst}
+geneList <- names(V(netWgcnaPpiFirst))
+
+gostres <- gost(query = geneList, 
+                organism = "gp__ZEow_oHws_ILU", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = FALSE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", sources = NULL)
+
+
+myterms = c("KEGG_SPLICEOSOME", "REACTOME_METABOLISM_OF_RNA", "REACTOME_MRNA_SPLICING", "GOBP_MRNA_METABOLIC_PROCESS", "GOBP_RNA_SPLICING", "GOCC_SPLICEOSOMAL_COMPLEX", "GOMF_RNA_BINDING", "HALLMARK_MYC_TARGETS_V1", "HALLMARK_MTORC1_SIGNALING")
+
+p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
+
+#write.csv(apply(gostres$result,2,as.character), file = "gostres_netWgcnaPpiFirst_gp__ZEow_oHws_ILU.tsv", row.names = F)
+
+pp <- publish_gostplot(p, highlight_terms = myterms, 
+                       width = 1200, height = 800, 
+                       #show_columns = c("source", "term_id", "term_size", "intersection_size"),
+                       filename = "figura_splice.png")
+```
+
+## HDAC2 network
+
+Here we create a network with only HDAC2 interactors.
+
+```{r hdac2 net}
+# Create a network for HDAC2
+netWgcnaPpiHDAC2 <- induced.subgraph(netWgcnaPpiFirst, vids = unlist( neighborhood(netWgcnaPpiFirst, order=1, nodes = V(netWgcnaPpiFirst)["HDAC2"]) ) )
+
+netWgcnaPpiHDAC2
+summary(E(netWgcnaPpiHDAC2)$weight)
+
+# Separate lncRNA and protein_coding for inspection
+protein_coding <- names(V(netWgcnaPpiHDAC2)[V(netWgcnaPpiHDAC2)$gene_type == "protein_coding"])
+lncRNA <- names(V(netWgcnaPpiHDAC2)[V(netWgcnaPpiHDAC2)$gene_type != "protein_coding"])
+
+# Write results
+#write_graph(netWgcnaPpiHDAC2, file = "netWgcnaPpiHDAC2.graphml", format = "graphml")
+#write.table(protein_coding, file = "for_RNAct_protein_coding.txt", quote = F, row.names = F, col.names = F)
+#write.table(lncRNA, file = "for_RNAct_lncRNA.txt", quote = F, row.names = F, col.names = F)
+```
+
+## Betweenness
+
+We filtered the network on weight (previously) and now we apply a betweenness filter due to the large number of conections among nodes. I calculated the percentiles for edge betweenness to choose a threshold to filter the network.
+
+```{r betweenness}
+vcount(netWgcnaPpiHDAC2) #354
+ecount(netWgcnaPpiHDAC2) #21552
+
+# Calculate edge betweenness
+edgeBet <- edge_betweenness(netWgcnaPpiHDAC2, e = E(netWgcnaPpiHDAC2))
+
+plot(quantile(edgeBet, seq(0, 1, 0.01)), main = "Edge Betweenness Percentile", xlab = "Percentile", ylab = "Edge Betweenness")
+
+quantile(edgeBet, seq(0, 1, 0.01))
+
+# Separate the 0.95 percentile
+i <- edgeBet > unname(quantile(edgeBet, 0.95))
+
+# Create a subgraph
+netWgcnaPpiHDAC2Clean <- subgraph.edges(netWgcnaPpiHDAC2, E(netWgcnaPpiHDAC2)[i], delete.vertices = TRUE)
+
+# Add edge betweenness
+E(netWgcnaPpiHDAC2Clean)$eb <- edge_betweenness(netWgcnaPpiHDAC2Clean, e = E(netWgcnaPpiHDAC2Clean))
+
+# Write results to inspect on Cytoscape
+#write_graph(netWgcnaPpiHDAC2Clean, file = "netWgcnaPpiHDAC2Clean.graphml", format = "graphml")
+```
+
+Now we have a network - netWgcnaPpiHDAC2Clean with `r vcount(netWgcnaPpiHDAC2Clean)` nodes and `r ecount(netWgcnaPpiHDAC2Clean)` edges, which is better to analyze.
+
+## Extract neighbors
+
+We can extract the neighbors of HDAC2 and their gene_type.
+
+```{r neighbors}
+neighHdac2 <- names(unlist(neighborhood(netWgcnaPpiHDAC2Clean, order=1, nodes = V(netWgcnaPpiHDAC2Clean)["HDAC2"])))
+resHdac2 <- tempAnnot %>% filter(gene_name %in% neighHdac2)
+
+# Add gene location on the genome
+resHdac2 <- resHdac2 %>% left_join(annot0, by = c("gene_id", "gene_name", "gene_type")) %>% select(-X)
+
+# Show results
+resHdac2
+
+# Arrange by edge betweenness and weight
+edgebetResHdac2 <- data.frame(as_edgelist(netWgcnaPpiHDAC2Clean)) %>% mutate(eb = E(netWgcnaPpiHDAC2Clean)$eb) %>% filter(X1 == "HDAC2" | X2 == "HDAC2") %>% arrange(desc(eb))
+edgeweiResHdac2 <- data.frame(as_edgelist(netWgcnaPpiHDAC2Clean)) %>% mutate(wei = E(netWgcnaPpiHDAC2Clean)$weight) %>% filter(X1 == "HDAC2" | X2 == "HDAC2") %>% arrange(desc(wei))
+
+#write.csv(resHdac2, file = "resHdac2.csv", row.names = F)
+#write.csv(edgebetResHdac2, file = "edgebetResHdac2.csv", row.names = F)
+#write.csv(edgeweiResHdac2, file = "edgeweiResHdac2.csv", row.names = F)
+
+head(edgebetResHdac2)
+edgeweiResHdac2
+```
+
+# Conclusion
+
+We created a cleaned HDAC2 network that we can analyze with Cytoscape.
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+

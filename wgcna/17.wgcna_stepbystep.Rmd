@@ -1,0 +1,523 @@
+---
+title: "WGCNA"
+author: "Rafael L. B. Coan"
+date: "27/09/2021"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/home/rstudio/")
+```
+
+# Introduction
+
+This is WGCNA analysis with step-by-step network construction, as oposed to [17.wgcna_vsd.Rmd](17.wgcna_vsd.Rmd), which is one-step network construction.
+
+https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/FemaleLiver-02-networkConstr-man.pdf
+
+```{r libraries, results='hide'}
+library("WGCNA")
+library("ggplot2")
+library("dplyr")
+```
+
+# Methods
+
+## Load data
+
+Load normalized data from previous notebooks (VST transformation).
+
+```{r load}
+options(stringsAsFactors = FALSE)
+data <- read.csv("vsdAnnot_11.brohl_normalization.csv", row.names = 1)
+```
+
+## Transpose matrix and clean data
+
+WGCNA works with a transposed matrix. Now we use the name `datExpr0` because outliers will be removed latter.
+
+```{r transpose clean}
+# Transpose and clean
+datExpr0 = as.data.frame(t(data[, -c(27:29)]))
+
+gsg = goodSamplesGenes(datExpr0, verbose = 3)
+gsg$allOK
+
+if (!gsg$allOK) {
+# Optionally, print the gene and sample names that were removed:
+if (sum(!gsg$goodGenes)>0)
+printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")));
+if (sum(!gsg$goodSamples)>0)
+printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")));
+# Remove the offending genes and samples from the data:
+datExpr0 = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+```
+
+## Cluster samples
+
+Now we can cluster (based on Eucledian distances) the samples to check for outliers.
+
+```{r cluster samples}
+sampleTree = hclust(dist(datExpr0), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,cex.axis = 1.5, cex.main = 2)
+```
+
+And we can automatically remove the outliers based on distances.
+
+```{r remove outliers}
+cutoff <- 250
+
+clust = cutreeStatic(sampleTree, cutHeight = cutoff, minSize = 10)
+
+# Repeat graph with cutoff
+sizeGrWindow(12,9)
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering with cutoff", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+abline(h = cutoff, col = "red")
+
+keepSamples = (clust==1)
+datExpr = datExpr0[keepSamples, ]
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+
+sampleTree2 = hclust(dist(datExpr), method = "average")
+sizeGrWindow(12,9)
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree2, main = "Sample clustering dendogram", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+```
+
+## Trait data
+
+```{r trait data}
+traitData = read.csv("samples_brohl_pheno.csv")
+dim(traitData)
+names(traitData)
+
+# Keep columns that we want
+allTraits = traitData[, -c(2:4, 8)]
+dim(allTraits)
+names(allTraits)
+
+# Match traits with expression matrix
+brohlSamples = rownames(datExpr)
+traitRows = match(brohlSamples, allTraits$Run)
+datTraits = allTraits[traitRows, -1]
+rownames(datTraits) = allTraits[traitRows, 1]
+```
+
+Relation between traits and expression.
+
+```{r trait expression}
+traitColors = labels2colors(datTraits, naColor = "grey")
+
+plotDendroAndColors(sampleTree2, traitColors, groupLabels = names(datTraits), main = "Sample dendogram and trait heatmap")
+```
+
+## Soft soft-thresholding power
+
+On WGCNA FAQ, they provide "sane defaults" to power value.
+
+| Number of samples | Unsigned and signed hybrid networks | Signed networks |
+|-------------------|-------------------------------------|-----------------|
+|  Less than 20     |  9                                  |  18             |
+|  20-30            |  8                                  |  16             |
+|  30-40            |  7                                  |  14             |
+|  more than 40     |  6                                  |  12             |
+
+Let's calculate.
+
+```{r power}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+
+# Plot values
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],xlab="Soft Threshold (power)",
+     ylab="Scale Free Topology Model Fit,signed R^2",type="n",main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],labels=powers,cex=cex1,col="red")
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.80,col="red")
+
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],xlab="Soft Threshold (power)",
+     ylab="Mean Connectivity", type="n",main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+
+#write.csv(sft, file = "sft.csv")
+```
+
+We can look at log10(p(k)) vs log10(k) plots to check our scale-free topology, R² and truncated R².
+
+```{r r2, fig.show="hold", out.width="50%"}
+sf <- function(expData, p) {
+  k = softConnectivity(expData, power = p)
+  sizeGrWindow(10,5)
+  par(mfrow=c(1,2))
+  hist(k)
+  scaleFreePlot(k, main=paste("Check scale free topology for ", p, "\n"))
+}
+
+softPower = 9
+#sf(datExpr, 8)
+sf(datExpr, softPower)
+
+#knitr::knit_exit()
+```
+
+We choose soft-thresholding of `r softPower`. We are starting the analysis with softPower of 9 (different from previous 8), so we can expect **less** connections between nodes and k smaller than before. We can change this value latter to get more results, if necessary.
+
+## Step-by-step network construction
+
+Construction of co-expression network.
+
+First step is to calculate co-expression adjacency matrix and TOM similarity and disimilarity.
+
+```{r network}
+# Adjacency
+adjacency = adjacency(datExpr, power = softPower)
+
+# TOM (topological overlap matrix)
+TOM = TOMsimilarity(adjacency);
+dissTOM = 1-TOM
+```
+
+Now we can cluster our network into modules.
+
+```{r clustering}
+# Clustering with TOM
+geneTree = hclust(as.dist(dissTOM), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", labels = FALSE, hang = 0.04)
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 30;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+deepSplit = 2, pamRespectsDendro = FALSE,
+minClusterSize = minModuleSize);
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut", dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05, main = "Gene dendrogram and module colors")
+```
+
+Now let's merge modules with similar expression profiles, based on eigengenes.
+
+```{r merge modules}
+# Calculate eigengenes
+MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(10, 9)
+plot(METree, main = "Clustering of module eigengenes", xlab = "", sub = "")
+
+MEDissThres = 0.3
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs
+```
+
+And we can compare merged modules with regulat modules.
+
+```{r compare merged}
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+c("Dynamic Tree Cut", "Merged dynamic"),
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05)
+#dev.off()
+```
+
+Save some variables.
+
+```{r save variables}
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+# Save module colors and labels for use in subsequent parts
+save(MEs, moduleLabels, moduleColors, geneTree, file = "17.wgcna-networkConstruction-stepByStep.RData")
+
+table(mergedColors)
+```
+
+##  Relating modules to external clinical traits
+
+```{r traits}
+# Define numbers of genes and samples
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+
+#write.csv(moduleTraitCor, file = "moduleTraitCor.csv")
+#write.csv(moduleTraitPvalue, file = "moduleTraitPvalue.csv")
+
+sizeGrWindow(20,30)
+tiff("traits.tiff", width = 1920, height = 1080, res = 300)
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "(",
+  signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor,
+  xLabels = names(datTraits),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.5,
+  cex.lab.y = 0.7,
+  zlim = c(-1,1),
+  main = paste("Module-trait relationships"))
+```
+
+## Legacy code
+
+### Gene relationship to trait and important modules: GS and MM
+
+We will postpone this type of analysis for now. Legacy code.
+
+```{r, eval=FALSE}
+# Choose the module
+module <- "lightyellow"
+
+# Define variable of interest containing the column of datTrait
+pheno = as.data.frame(datTraits$TP53)
+names(pheno) = "TP53"
+# names (colors) of the modules
+modNames = substring(names(MEs), 3)
+geneModuleMembership =
+  as.data.frame(cor(datExpr, MEs, use = "p"))
+MMPvalue =
+  as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+names(geneModuleMembership) = paste("MM", modNames, sep = "")
+names(MMPvalue) = paste("p.MM", modNames, sep = "")
+geneTraitSignificance =
+  as.data.frame(cor(datExpr, pheno, use = "p"))
+GSPvalue =
+  as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+names(geneTraitSignificance) = paste("GS.", names(pheno), sep = "")
+names(GSPvalue) = paste("p.GS.", names(pheno), sep = "")
+```
+
+###  Intramodular analysis: identifying genes with high GS and MM
+
+Legacy code.
+
+```{r eval=FALSE}
+column = match(module, modNames)
+moduleGenes = moduleColors == module
+sizeGrWindow(7, 7)
+par(mfrow = c(1, 1))
+verboseScatterplot(
+  abs(geneModuleMembership[moduleGenes, column]),
+  abs(geneTraitSignificance[moduleGenes, 1]),
+  xlab = paste("Module Membership in", module, "module"),
+  ylab = "Gene significance",
+  main = paste("Module membership vs. gene significance\n"),
+  cex.main = 1.2,
+  cex.lab = 1.2,
+  cex.axis = 1.2,
+  col = module
+)
+```
+
+### Summary output of network analysis results (legacy)
+
+Legacy code.
+
+```{r eval=FALSE}
+annot0 <- read.csv("annot/data/gene_ids.csv")
+probes0 = names(datExpr)
+annot <- annot0 %>% select(gene_id, gene_name)
+probes <- as.data.frame(probes0) %>% inner_join(annot, by = c("probes0" = "gene_id"))
+colnames(probes) <- c("gene_id", "gene_name")
+
+# Create the starting data frame
+geneInfo0 = data.frame(
+  gene_id = probes$gene_id,
+  gene_name = probes$gene_name,
+  moduleColor = moduleColors,
+  geneTraitSignificance,
+  GSPvalue
+)
+
+# Order modules by their significance for weight
+modOrder = order(-abs(cor(MEs, pheno, use = "p")));
+# Add module membership information in the chosen order
+for (mod in 1:ncol(geneModuleMembership)) {
+  oldNames = names(geneInfo0)
+  geneInfo0 = data.frame(geneInfo0, geneModuleMembership[, modOrder[mod]],
+                         MMPvalue[, modOrder[mod]])
+  
+  names(geneInfo0) = c(oldNames,
+                       paste("MM.", modNames[modOrder[mod]], sep = ""),
+                       paste("p.MM.", modNames[modOrder[mod]], sep = ""))
+}
+# Order the genes in the geneInfo variable first by module color, then by geneTraitSignificance
+geneOrder = order(geneInfo0$moduleColor, -abs(geneInfo0$GS.));
+geneInfo = geneInfo0[geneOrder, ]
+
+#write.csv(geneInfo, file = "geneInfo_vsd.csv")
+```
+
+
+## Summary output of network analysis results
+
+Previous code exports genes and modules together with GS and MM. The following code just saves gene and module information.
+
+```{r summary}
+annot0 <- read.csv("annot/data/gene_ids.csv")
+probes0 = names(datExpr)
+annot <- annot0 %>% select(gene_id, gene_name)
+probes <- as.data.frame(probes0) %>% inner_join(annot, by = c("probes0" = "gene_id"))
+colnames(probes) <- c("gene_id", "gene_name")
+
+# Create the starting data frame
+geneInfo0 = data.frame(
+  gene_id = probes$gene_id,
+  gene_name = probes$gene_name,
+  moduleColor = moduleColors
+)
+
+# Order the genes in the geneInfo variable first by module color, then by geneTraitSignificance
+geneOrder = order(geneInfo0$moduleColor)
+geneInfo = geneInfo0[geneOrder, ]
+
+write.csv(geneInfo, file = "geneInfo_step.csv")
+```
+
+# Results
+
+## Top hub genes
+
+Top hub genes in each module.
+
+```{r top hubs}
+# Hub genes
+topHub <- as.data.frame(chooseTopHubInEachModule(datExpr, moduleColors))
+topHub <- topHub %>% tibble::rownames_to_column(var = "module")
+colnames(topHub) <- c("module", "gene_id")
+topHub <- topHub %>% inner_join(annot0, by = "gene_id")
+topHub
+```
+
+## HDACs
+
+We can look the module name of each HDAC.
+
+```{r hdacs modules}
+ensembl = c("ENSG00000116478", "ENSG00000196591", "ENSG00000171720", "ENSG00000068024", "ENSG00000108840", "ENSG00000094631", "ENSG00000061273", "ENSG00000147099", "ENSG00000048052", "ENSG00000100429", "ENSG00000163517")
+hugo = c("HDAC1", "HDAC2", "HDAC3", "HDAC4", "HDAC5", "HDAC6", "HDAC7", "HDAC8", "HDAC9", "HDAC10", "HDAC11")
+
+hdacs <- data.frame(ensembl, hugo)
+names(moduleLabels) <- names(datExpr)
+names(moduleColors) <- names(datExpr)
+hdacs <- hdacs %>% mutate(mod_number = moduleLabels[ensembl], mod_color = moduleColors[ensembl])
+hdacs
+```
+
+## Save genes to file
+
+Extract genes from each module and saves in a csv file.
+
+```{r extract genes}
+myModules <- levels(factor(geneInfo$moduleColor))
+
+geneModules <- list()
+for (color in myModules) {
+  geneModules[color] <- geneInfo %>% filter(moduleColor == color) %>% dplyr::select(gene_name)
+}
+
+geneModulesFinal <- t(plyr::ldply(geneModules, rbind))
+colnames(geneModulesFinal) <- geneModulesFinal[1,]
+geneModulesFinal <- geneModulesFinal[-1,]
+
+write.csv(geneModulesFinal, file = "geneModulesFinal_step.csv", quote = FALSE)
+```
+
+## Extract HDAC9
+
+Module darkmagenta (HDAC9, HDAC8 and HDAC2).
+
+```{r hdac9}
+# Clean objects for memory save
+rm(adjacency)
+rm(dissTOM)
+
+# Add gene ids to TOM
+dimnames(TOM) = list(probes$gene_name, probes$gene_name)
+# Save TOM for another environment
+#save(TOM, geneInfo, annot0, file = "TOM_step.RData")
+
+#net <- igraph::graph.adjacency(TOM, weighted = TRUE, mode = "undirected")
+
+#-------------------------
+annot1 <- annot0 %>% dplyr::select(gene_id, gene_name, gene_type)
+probes1 <- as.data.frame(probes0) %>% inner_join(annot1, by = c("probes0" = "gene_id"))
+colnames(probes1) <- c("gene_id", "gene_name", "gene_type")
+
+# Select module probes
+#probes = names(datExpr)
+modules <- c("darkmagenta")
+inModule = is.finite(match(moduleColors, modules))
+
+modProbes = probes1[inModule,]
+#modGenes = annot1$gene_id[match(modProbes, annot1$gene_name)];
+# Select the corresponding Topological Overlap
+modTOM = TOM[inModule, inModule]
+
+save(modTOM, geneInfo, annot0, probes1, file = "modTOM_step.RData")
+```
+
+# Conclusion
+
+# SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+```
+
